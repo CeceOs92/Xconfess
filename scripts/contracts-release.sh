@@ -3,9 +3,16 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-CONTRACTS_DIR="$REPO_ROOT/xconfess-contracts"
-TARGET_DIR="$CONTRACTS_DIR/target/wasm32-unknown-unknown/release"
+REPO_ROOT="${XCONFESS_REPO_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+CONTRACTS_DIR="${XCONFESS_CONTRACTS_DIR:-$REPO_ROOT/xconfess-contracts}"
+TARGET_DIR="${XCONFESS_TARGET_DIR:-$CONTRACTS_DIR/target/wasm32-unknown-unknown/release}"
+if [[ -z "${PYTHON_BIN:-}" ]]; then
+  if command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="python3"
+  else
+    PYTHON_BIN="python"
+  fi
+fi
 
 CONTRACT_CRATES=(
   "confession-anchor"
@@ -52,7 +59,7 @@ write_manifest() {
   local generated_at
   generated_at="$(timestamp_utc)"
 
-  python - "$CONTRACTS_DIR" "$TARGET_DIR" "$output_file" "$generated_at" "${CONTRACT_CRATES[@]}" <<'PY'
+  "$PYTHON_BIN" - "$CONTRACTS_DIR" "$TARGET_DIR" "$output_file" "$generated_at" "${CONTRACT_CRATES[@]}" <<'PY'
 import hashlib
 import json
 import pathlib
@@ -122,9 +129,29 @@ verify_only() {
 deploy_all() {
   local network="$1"
   local source_key="$2"
+  local dry_run="$3"
+  local force="$4"
 
   require_cmd stellar
   verify_only
+
+  local output_file="$REPO_ROOT/deployments/${network}.json"
+  if [[ "$dry_run" != "true" && ! -f "$output_file" && "$force" != "true" ]]; then
+    echo "Rollback guard: no previous deployment metadata found for network '$network'." >&2
+    echo "If this is an intentional first-time deployment, re-run with --force to proceed." >&2
+    exit 1
+  fi
+
+  if [[ "$dry_run" == "true" ]]; then
+    if [[ ! -f "$output_file" ]]; then
+      echo "Dry-run mode enabled. Build artifacts are verified, but no prior deployment metadata was found for network '$network'."
+      echo "If this is the first deployment, the actual run requires --force to bypass rollback safety."
+    else
+      echo "Dry-run mode enabled. Build artifacts are verified and deployment metadata path is: $output_file"
+    fi
+    echo "No contracts were deployed. To execute the deployment, rerun without --dry-run."
+    return 0
+  fi
 
   local generated_at
   generated_at="$(timestamp_utc)"
@@ -142,7 +169,7 @@ deploy_all() {
   done
 
   local output_file="$REPO_ROOT/deployments/${network}.json"
-  python - "$CONTRACTS_DIR" "$TARGET_DIR" "$output_file" "$generated_at" "$network" "$source_key" "$ids_file" "${CONTRACT_CRATES[@]}" <<'PY'
+  "$PYTHON_BIN" - "$CONTRACTS_DIR" "$TARGET_DIR" "$output_file" "$generated_at" "$network" "$source_key" "$ids_file" "${CONTRACT_CRATES[@]}" <<'PY'
 import hashlib
 import json
 import pathlib
@@ -203,12 +230,16 @@ print_help() {
 Usage:
   ./scripts/contracts-release.sh build
   ./scripts/contracts-release.sh verify
-  ./scripts/contracts-release.sh deploy --network <network> --source <stellar-key-name>
+  ./scripts/contracts-release.sh deploy --network <network> --source <stellar-key-name> [--dry-run] [--force]
 
 Commands:
   build    Build all contract crates reproducibly and generate a manifest
   verify   Verify all expected artifacts exist and regenerate the manifest
   deploy   Deploy all artifacts and write per-network deployment metadata
+
+Options:
+  --dry-run  Verify build artifacts and deployment readiness without deploying contracts
+  --force    Allow deploy to proceed even when no prior deployment metadata exists
 EOF
 }
 
@@ -230,6 +261,8 @@ main() {
       shift || true
       local network=""
       local source_key=""
+      local dry_run="false"
+      local force="false"
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --network)
@@ -239,6 +272,14 @@ main() {
           --source)
             source_key="${2:-}"
             shift 2
+            ;;
+          --dry-run)
+            dry_run="true"
+            shift
+            ;;
+          --force)
+            force="true"
+            shift
             ;;
           *)
             echo "Unknown argument: $1" >&2
@@ -252,7 +293,7 @@ main() {
         print_help
         exit 1
       fi
-      deploy_all "$network" "$source_key"
+      deploy_all "$network" "$source_key" "$dry_run" "$force"
       ;;
     -h|--help|help|"")
       print_help
@@ -265,4 +306,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
